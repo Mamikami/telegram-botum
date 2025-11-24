@@ -9,11 +9,12 @@ from aiogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardB
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+# Hata türlerini yakalamak için eklemeler
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 
 # --- YAPILANDIRMA ---
 API_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-# Render'ın bize verdiği portu alıyoruz (Varsayılan 8080)
 PORT = int(os.getenv("PORT", 8080))
 
 ADMIN_USER = "zeroadmin"
@@ -167,18 +168,50 @@ async def cb_broadcast(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("📢 Duyuru mesajını yazın:", reply_markup=cancel_keyboard())
     await state.set_state(AdminState.waiting_broadcast_msg)
 
+# --- GÜNCELLENMİŞ VE DETAYLI DUYURU SİSTEMİ ---
 @dp.message(AdminState.waiting_broadcast_msg)
 async def process_broadcast(message: types.Message, state: FSMContext):
     users = await get_all_users()
-    msg = await message.answer(f"⏳ Duyuru {len(users)} kişiye gönderiliyor...")
-    success, blocked = 0, 0
+    msg = await message.answer(f"⏳ Duyuru {len(users)} kişiye gönderiliyor... Lütfen bekleyin.")
+    
+    success = 0
+    blocked = 0
+    other_errors = 0
+    
     for uid in users:
         try:
             await bot.send_message(chat_id=uid, text=message.text)
             success += 1
-            await asyncio.sleep(0.05)
-        except: blocked += 1
-    await msg.edit_text(f"✅ **Tamamlandı!**\nUlaşan: {success}\nHata: {blocked}", reply_markup=main_menu_keyboard())
+            await asyncio.sleep(0.05) # Hızlı gönderim limiti koruması
+            
+        except TelegramForbiddenError:
+            # Kullanıcı botu gerçekten engellemiş
+            blocked += 1
+            
+        except TelegramRetryAfter as e:
+            # Telegram "Çok hızlı gidiyorsun" dedi
+            print(f"Hız limiti! {e.retry_after} saniye bekleniyor...")
+            await asyncio.sleep(e.retry_after)
+            # Tekrar deniyoruz
+            try:
+                await bot.send_message(chat_id=uid, text=message.text)
+                success += 1
+            except:
+                other_errors += 1
+                
+        except Exception as e:
+            # Başka bir hata (ID hatalı, Kullanıcı silinmiş, vb.)
+            other_errors += 1
+            print(f"⚠️ HATA (Kullanıcı ID: {uid}): {e}") # Loglara hatayı yaz
+            
+    await msg.edit_text(
+        f"✅ **Duyuru Tamamlandı!**\n\n"
+        f"✅ Ulaşan: {success}\n"
+        f"🚫 Engelleyen: {blocked}\n"
+        f"⚠️ Diğer Hatalar: {other_errors}\n\n"
+        f"*(Diğer hataların sebebini Render Logs kısmında görebilirsin)*",
+        reply_markup=main_menu_keyboard()
+    )
     await state.clear()
 
 @dp.callback_query(F.data == "set_welcome")
@@ -210,9 +243,8 @@ async def join_request_handler(update: ChatJoinRequest):
 
 async def main():
     await db_baslat()
-    # ÖNCE web sunucusunu başlatıyoruz
     await start_web_server()
-    print("Bot çalışıyor... (PostgreSQL + Fake Web Server)")
+    print("Bot çalışıyor... (PostgreSQL + Detaylı Hata Analizi)")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

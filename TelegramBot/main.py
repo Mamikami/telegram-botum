@@ -2,35 +2,34 @@ import logging
 import asyncio
 import asyncpg
 import os
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # --- YAPILANDIRMA ---
-# Bot Token'ı (Render'a Environment Variable olarak ekleyeceğiz)
 API_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Veritabanı Linki (Render'dan aldığın link)
 DATABASE_URL = os.getenv("DATABASE_URL")
+# Render'ın bize verdiği portu alıyoruz (Varsayılan 8080)
+PORT = int(os.getenv("PORT", 8080))
 
-# Eğer bilgisayarında test ediyorsan bu satırları açıp kendi bilgilerini yazabilirsin:
-# API_TOKEN = "SENİN_TOKENIN"
-# DATABASE_URL = "postgresql://..."
-
-# Admin Giriş Bilgileri
 ADMIN_USER = "zeroadmin"
 ADMIN_PASS = "123456"
 
 logging.basicConfig(level=logging.INFO)
+
+if not API_TOKEN:
+    print("HATA: TELEGRAM_TOKEN bulunamadı!")
+    exit(1)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 LOGGED_IN_ADMINS = set()
 DEFAULT_WELCOME = "Merhaba! Kanalımıza hoş geldin. 👋"
 
-# Veritabanı Bağlantı Havuzu (Global)
 db_pool = None
 
 class AdminState(StatesGroup):
@@ -39,76 +38,82 @@ class AdminState(StatesGroup):
     waiting_broadcast_msg = State()
     waiting_welcome_msg = State()
 
-# --- VERİTABANI İŞLEMLERİ (POSTGRESQL) ---
+# --- SAHTE WEB SUNUCUSU (RENDER İÇİN) ---
+async def health_check(request):
+    return web.Response(text="Bot calisiyor! Render mutlu olsun :)")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"Web sunucusu {PORT} portunda başlatıldı.")
+
+# --- VERİTABANI İŞLEMLERİ ---
 async def db_baslat():
     global db_pool
-    # Bağlantı havuzunu oluştur
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    if not DATABASE_URL:
+        print("HATA: DATABASE_URL bulunamadı!")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        print("Veritabanı bağlantısı başarılı.")
+    except Exception as e:
+        print(f"Veritabanı bağlantı hatası: {e}")
+        return
     
     async with db_pool.acquire() as conn:
-        # Tabloları oluştur
-        # Telegram ID'leri büyük olduğu için BIGINT kullanıyoruz
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
+        await conn.execute('''CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY, 
                 username TEXT,
                 full_name TEXT,
-                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY, 
-                value TEXT
-            )
-        ''')
+                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        await conn.execute('''CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT)''')
 
 async def get_welcome_message():
+    if not db_pool: return DEFAULT_WELCOME
     async with db_pool.acquire() as conn:
         value = await conn.fetchval("SELECT value FROM settings WHERE key = 'welcome_msg'")
         return value if value else DEFAULT_WELCOME
 
 async def set_welcome_message(text):
+    if not db_pool: return
     async with db_pool.acquire() as conn:
-        # PostgreSQL'de "UPSERT" işlemi (Varsa güncelle, yoksa ekle)
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ('welcome_msg', $1)
-            ON CONFLICT (key) DO UPDATE SET value = $1
-        """, text)
+        await conn.execute("""INSERT INTO settings (key, value) VALUES ('welcome_msg', $1)
+            ON CONFLICT (key) DO UPDATE SET value = $1""", text)
 
 async def get_all_users():
+    if not db_pool: return []
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM users")
         return [row['user_id'] for row in rows]
 
 async def get_user_count():
+    if not db_pool: return 0
     async with db_pool.acquire() as conn:
         count = await conn.fetchval("SELECT COUNT(*) FROM users")
         return count
 
 async def add_user(user_id, username, full_name):
+    if not db_pool: return
     async with db_pool.acquire() as conn:
-        # ON CONFLICT DO NOTHING: Eğer kullanıcı zaten varsa hata verme, geç.
-        await conn.execute("""
-            INSERT INTO users (user_id, username, full_name) VALUES ($1, $2, $3)
-            ON CONFLICT (user_id) DO NOTHING
-        """, user_id, username, full_name)
+        await conn.execute("""INSERT INTO users (user_id, username, full_name) VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO NOTHING""", user_id, username, full_name)
 
-# --- KLAVYELER ---
+# --- HANDLERLAR ---
 def main_menu_keyboard():
-    kb = [
-        [InlineKeyboardButton(text="📊 İstatistikler", callback_data="stats"),
+    kb = [[InlineKeyboardButton(text="📊 İstatistikler", callback_data="stats"),
          InlineKeyboardButton(text="📢 Duyuru Yap", callback_data="broadcast")],
         [InlineKeyboardButton(text="📝 Hoş Geldin Mesajı Ayarla", callback_data="set_welcome")],
-        [InlineKeyboardButton(text="🚪 Çıkış Yap", callback_data="logout")]
-    ]
+        [InlineKeyboardButton(text="🚪 Çıkış Yap", callback_data="logout")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def cancel_keyboard():
     kb = [[InlineKeyboardButton(text="❌ İptal", callback_data="cancel_action")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
-
-# --- HANDLERLAR ---
 
 @dp.message(Command("panel"))
 async def cmd_login(message: types.Message, state: FSMContext):
@@ -122,7 +127,6 @@ async def cmd_login(message: types.Message, state: FSMContext):
 async def process_username(message: types.Message, state: FSMContext):
     try: await message.delete()
     except: pass
-    
     if message.text == ADMIN_USER:
         await state.update_data(username=message.text)
         await message.answer("✅ Kullanıcı adı doğru. 🔑 Şifreyi giriniz:")
@@ -135,7 +139,6 @@ async def process_username(message: types.Message, state: FSMContext):
 async def process_password(message: types.Message, state: FSMContext):
     try: await message.delete()
     except: pass
-    
     if message.text == ADMIN_PASS:
         LOGGED_IN_ADMINS.add(message.from_user.id)
         await message.answer("✅ **Giriş Başarılı!**", reply_markup=main_menu_keyboard())
@@ -154,7 +157,6 @@ async def cb_logout(callback: types.CallbackQuery):
 async def cb_stats(callback: types.CallbackQuery):
     if callback.from_user.id not in LOGGED_IN_ADMINS:
         return await callback.answer("Giriş yapmalısınız!", show_alert=True)
-    
     total_users = await get_user_count()
     await callback.message.edit_text(f"📊 **İstatistikler**\n\n👥 Toplam Üye: {total_users}", reply_markup=main_menu_keyboard())
 
@@ -169,17 +171,13 @@ async def cb_broadcast(callback: types.CallbackQuery, state: FSMContext):
 async def process_broadcast(message: types.Message, state: FSMContext):
     users = await get_all_users()
     msg = await message.answer(f"⏳ Duyuru {len(users)} kişiye gönderiliyor...")
-    
-    success = 0
-    blocked = 0
+    success, blocked = 0, 0
     for uid in users:
         try:
             await bot.send_message(chat_id=uid, text=message.text)
             success += 1
             await asyncio.sleep(0.05)
-        except:
-            blocked += 1
-            
+        except: blocked += 1
     await msg.edit_text(f"✅ **Tamamlandı!**\nUlaşan: {success}\nHata: {blocked}", reply_markup=main_menu_keyboard())
     await state.clear()
 
@@ -211,12 +209,12 @@ async def join_request_handler(update: ChatJoinRequest):
         print(f"Hata: {e}")
 
 async def main():
-    # Veritabanını başlat
     await db_baslat()
-    print("Bot çalışıyor... (PostgreSQL Bağlantılı)")
+    # ÖNCE web sunucusunu başlatıyoruz
+    await start_web_server()
+    print("Bot çalışıyor... (PostgreSQL + Fake Web Server)")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
     asyncio.run(main())
-

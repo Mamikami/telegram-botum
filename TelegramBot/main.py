@@ -9,7 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # --- YAPILANDIRMA ---
-API_TOKEN = '8329128813:AAGnRZzaRy5zSQqD9f8h7W5GldiSV-skq_I'
+API_TOKEN = '8529288120:AAFxqFwAJfMR5UbiQOXHqkVYpe7vEBAxVl8'
 
 # Admin Giriş Bilgileri
 ADMIN_USER = "zeroadmin"

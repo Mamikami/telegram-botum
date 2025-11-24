@@ -1,6 +1,7 @@
 import logging
 import asyncio
-import aiosqlite
+import asyncpg
+import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton
@@ -9,59 +10,91 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # --- YAPILANDIRMA ---
-API_TOKEN = '8529288120:AAFxqFwAJfMR5UbiQOXHqkVYpe7vEBAxVl8'
+# Bot Token'ı (Render'a Environment Variable olarak ekleyeceğiz)
+API_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Veritabanı Linki (Render'dan aldığın link)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Eğer bilgisayarında test ediyorsan bu satırları açıp kendi bilgilerini yazabilirsin:
+# API_TOKEN = "SENİN_TOKENIN"
+# DATABASE_URL = "postgresql://..."
 
 # Admin Giriş Bilgileri
 ADMIN_USER = "zeroadmin"
 ADMIN_PASS = "123456"
 
-# Loglama
 logging.basicConfig(level=logging.INFO)
 
-# Bot kurulumu
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-# Giriş yapmış adminlerin ID'sini hafızada tutar (Bot kapanınca sıfırlanır)
 LOGGED_IN_ADMINS = set()
-
-# Varsayılan Hoş Geldin Mesajı
 DEFAULT_WELCOME = "Merhaba! Kanalımıza hoş geldin. 👋"
 
-# --- DURUM MAKİNESİ (STATES) ---
+# Veritabanı Bağlantı Havuzu (Global)
+db_pool = None
+
 class AdminState(StatesGroup):
     waiting_username = State()
     waiting_password = State()
     waiting_broadcast_msg = State()
     waiting_welcome_msg = State()
 
-# --- VERİTABANI ---
+# --- VERİTABANI İŞLEMLERİ (POSTGRESQL) ---
 async def db_baslat():
-    async with aiosqlite.connect('bot_database.db') as db:
-        # Kullanıcılar tablosu
-        await db.execute('''CREATE TABLE IF NOT EXISTS users (
-                            user_id INTEGER PRIMARY KEY, 
-                            username TEXT,
-                            full_name TEXT,
-                            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-        # Ayarlar tablosu (Hoş geldin mesajını kaydetmek için)
-        await db.execute('''CREATE TABLE IF NOT EXISTS settings (
-                            key TEXT PRIMARY KEY, 
-                            value TEXT)''')
-        await db.commit()
+    global db_pool
+    # Bağlantı havuzunu oluştur
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    
+    async with db_pool.acquire() as conn:
+        # Tabloları oluştur
+        # Telegram ID'leri büyük olduğu için BIGINT kullanıyoruz
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY, 
+                username TEXT,
+                full_name TEXT,
+                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, 
+                value TEXT
+            )
+        ''')
 
 async def get_welcome_message():
-    async with aiosqlite.connect('bot_database.db') as db:
-        async with db.execute("SELECT value FROM settings WHERE key = 'welcome_msg'") as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else DEFAULT_WELCOME
+    async with db_pool.acquire() as conn:
+        value = await conn.fetchval("SELECT value FROM settings WHERE key = 'welcome_msg'")
+        return value if value else DEFAULT_WELCOME
 
 async def set_welcome_message(text):
-    async with aiosqlite.connect('bot_database.db') as db:
-        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('welcome_msg', ?)", (text,))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        # PostgreSQL'de "UPSERT" işlemi (Varsa güncelle, yoksa ekle)
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('welcome_msg', $1)
+            ON CONFLICT (key) DO UPDATE SET value = $1
+        """, text)
 
-# --- KLAVYELER (BUTONLAR) ---
+async def get_all_users():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+        return [row['user_id'] for row in rows]
+
+async def get_user_count():
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        return count
+
+async def add_user(user_id, username, full_name):
+    async with db_pool.acquire() as conn:
+        # ON CONFLICT DO NOTHING: Eğer kullanıcı zaten varsa hata verme, geç.
+        await conn.execute("""
+            INSERT INTO users (user_id, username, full_name) VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO NOTHING
+        """, user_id, username, full_name)
+
+# --- KLAVYELER ---
 def main_menu_keyboard():
     kb = [
         [InlineKeyboardButton(text="📊 İstatistikler", callback_data="stats"),
@@ -75,11 +108,10 @@ def cancel_keyboard():
     kb = [[InlineKeyboardButton(text="❌ İptal", callback_data="cancel_action")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- HANDLERLAR: GİRİŞ SİSTEMİ ---
+# --- HANDLERLAR ---
 
 @dp.message(Command("panel"))
 async def cmd_login(message: types.Message, state: FSMContext):
-    # Eğer zaten giriş yapmışsa paneli göster
     if message.from_user.id in LOGGED_IN_ADMINS:
         await message.answer("🔓 Yönetim Paneli:", reply_markup=main_menu_keyboard())
     else:
@@ -88,145 +120,103 @@ async def cmd_login(message: types.Message, state: FSMContext):
 
 @dp.message(AdminState.waiting_username)
 async def process_username(message: types.Message, state: FSMContext):
-    # Güvenlik: Kullanıcının yazdığı mesajı hemen sil
-    try:
-        await message.delete()
-    except:
-        pass # Yetki yoksa silinemeyebilir
-
+    try: await message.delete()
+    except: pass
+    
     if message.text == ADMIN_USER:
         await state.update_data(username=message.text)
-        msg = await message.answer("✅ Kullanıcı adı doğru.\n🔑 Lütfen **Şifreyi** giriniz:")
-        # Botun sorusunu da kaydet (gerekirse silmek için)
-        await state.update_data(last_bot_msg_id=msg.message_id)
+        await message.answer("✅ Kullanıcı adı doğru. 🔑 Şifreyi giriniz:")
         await state.set_state(AdminState.waiting_password)
     else:
-        await message.answer("❌ Hatalı kullanıcı adı. İşlem iptal edildi.")
+        await message.answer("❌ Hatalı kullanıcı adı.")
         await state.clear()
 
 @dp.message(AdminState.waiting_password)
 async def process_password(message: types.Message, state: FSMContext):
-    # Güvenlik: Şifreyi hemen sil
-    try:
-        await message.delete()
-    except:
-        pass
-
+    try: await message.delete()
+    except: pass
+    
     if message.text == ADMIN_PASS:
         LOGGED_IN_ADMINS.add(message.from_user.id)
-        await message.answer("✅ **Giriş Başarılı!** Hoş geldiniz.", reply_markup=main_menu_keyboard())
+        await message.answer("✅ **Giriş Başarılı!**", reply_markup=main_menu_keyboard())
         await state.clear()
     else:
-        await message.answer("❌ Hatalı şifre. Erişim reddedildi.")
+        await message.answer("❌ Hatalı şifre.")
         await state.clear()
-
-# --- HANDLERLAR: PANEL İŞLEMLERİ ---
 
 @dp.callback_query(F.data == "logout")
 async def cb_logout(callback: types.CallbackQuery):
     if callback.from_user.id in LOGGED_IN_ADMINS:
         LOGGED_IN_ADMINS.remove(callback.from_user.id)
-    await callback.message.edit_text("🔒 Çıkış yapıldı. Tekrar girmek için /panel yazın.")
+    await callback.message.edit_text("🔒 Çıkış yapıldı.")
 
 @dp.callback_query(F.data == "stats")
 async def cb_stats(callback: types.CallbackQuery):
     if callback.from_user.id not in LOGGED_IN_ADMINS:
-        return await callback.answer("Lütfen önce giriş yapın!", show_alert=True)
+        return await callback.answer("Giriş yapmalısınız!", show_alert=True)
     
-    async with aiosqlite.connect('bot_database.db') as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-            count = await cursor.fetchone()
-            total_users = count[0]
-            
+    total_users = await get_user_count()
     await callback.message.edit_text(f"📊 **İstatistikler**\n\n👥 Toplam Üye: {total_users}", reply_markup=main_menu_keyboard())
 
 @dp.callback_query(F.data == "broadcast")
 async def cb_broadcast(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in LOGGED_IN_ADMINS:
-        return await callback.answer("Lütfen önce giriş yapın!", show_alert=True)
-    
-    await callback.message.edit_text("📢 **Duyuru Modu**\n\nTüm kullanıcılara göndermek istediğiniz mesajı yazın:", reply_markup=cancel_keyboard())
+        return await callback.answer("Giriş yapmalısınız!", show_alert=True)
+    await callback.message.edit_text("📢 Duyuru mesajını yazın:", reply_markup=cancel_keyboard())
     await state.set_state(AdminState.waiting_broadcast_msg)
 
 @dp.message(AdminState.waiting_broadcast_msg)
 async def process_broadcast(message: types.Message, state: FSMContext):
-    users = []
-    async with aiosqlite.connect('bot_database.db') as db:
-        async with db.execute("SELECT user_id FROM users") as cursor:
-            users = await cursor.fetchall()
-            
+    users = await get_all_users()
     msg = await message.answer(f"⏳ Duyuru {len(users)} kişiye gönderiliyor...")
     
     success = 0
     blocked = 0
-    
-    for user in users:
+    for uid in users:
         try:
-            await bot.send_message(chat_id=user[0], text=message.text)
+            await bot.send_message(chat_id=uid, text=message.text)
             success += 1
-            await asyncio.sleep(0.05) # Spam koruması
+            await asyncio.sleep(0.05)
         except:
             blocked += 1
             
-    await msg.edit_text(f"✅ **Duyuru Tamamlandı!**\n\nUlaşan: {success}\nEngellemiş/Hata: {blocked}", reply_markup=main_menu_keyboard())
+    await msg.edit_text(f"✅ **Tamamlandı!**\nUlaşan: {success}\nHata: {blocked}", reply_markup=main_menu_keyboard())
     await state.clear()
 
 @dp.callback_query(F.data == "set_welcome")
 async def cb_set_welcome(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in LOGGED_IN_ADMINS:
-        return await callback.answer("Yetkisiz giriş.", show_alert=True)
-    
-    current_msg = await get_welcome_message()
-    await callback.message.edit_text(f"📝 **Hoş Geldin Mesajı**\n\nŞu anki mesaj:\n_{current_msg}_\n\nYeni mesajı aşağıya yazın:", parse_mode="Markdown", reply_markup=cancel_keyboard())
+    current = await get_welcome_message()
+    await callback.message.edit_text(f"📝 Şu anki mesaj:\n_{current}_\n\nYeni mesajı yazın:", parse_mode="Markdown", reply_markup=cancel_keyboard())
     await state.set_state(AdminState.waiting_welcome_msg)
 
 @dp.message(AdminState.waiting_welcome_msg)
 async def process_welcome_msg(message: types.Message, state: FSMContext):
     await set_welcome_message(message.text)
-    await message.answer("✅ Hoş geldin mesajı güncellendi!", reply_markup=main_menu_keyboard())
+    await message.answer("✅ Güncellendi!", reply_markup=main_menu_keyboard())
     await state.clear()
 
 @dp.callback_query(F.data == "cancel_action")
 async def cb_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("İşlem iptal edildi. Ana menü:", reply_markup=main_menu_keyboard())
+    await callback.message.edit_text("İptal edildi.", reply_markup=main_menu_keyboard())
 
-# --- HANDLER: KANAL KATILIM İSTEĞİ (Botun Asıl Görevi) ---
 @dp.chat_join_request()
 async def join_request_handler(update: ChatJoinRequest):
-    # 1. İsteği onayla
     try:
         await update.approve()
+        await add_user(update.from_user.id, update.from_user.username, update.from_user.full_name)
+        welcome_text = await get_welcome_message()
+        await bot.send_message(chat_id=update.from_user.id, text=welcome_text)
     except Exception as e:
-        print(f"Onay hatası: {e}")
-        return
+        print(f"Hata: {e}")
 
-    # 2. Veritabanına kaydet
-    user_id = update.from_user.id
-    username = update.from_user.username
-    full_name = update.from_user.full_name
-    
-    async with aiosqlite.connect('bot_database.db') as db:
-        try:
-            await db.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)", (user_id, username, full_name))
-            await db.commit()
-        except Exception as e:
-            print(f"DB Kayıt Hatası: {e}")
-
-    # 3. Hoş geldin mesajı gönder
-    welcome_text = await get_welcome_message()
-    try:
-        await bot.send_message(chat_id=user_id, text=welcome_text)
-    except Exception as e:
-        print(f"Mesaj gönderilemedi: {e}")
-
-# --- BAŞLATMA ---
 async def main():
+    # Veritabanını başlat
     await db_baslat()
-    print("Bot çalışıyor... (Giriş komutu: /panel)")
-    # bekleyen update'leri siler (bot kapalıyken gelenleri)
-    await bot.delete_webhook(drop_pending_updates=True) 
+    print("Bot çalışıyor... (PostgreSQL Bağlantılı)")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
     asyncio.run(main())
+
